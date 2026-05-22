@@ -1,0 +1,380 @@
+ Deep Dive: SQL Server TempDB Troubleshooting With Practical Scripts
+
+TempDB is the workhorse database of SQL Server and is used for temporary objects, work tables, row versioning, and many internal engine operations. When TempDB has issues such as contention or running out of space, the entire instance can slow down or become unstable. [learn.microsoft](https://learn.microsoft.com/en-us/sql/relational-databases/databases/tempdb-database?view=sql-server-ver17)
+
+In this article, we will cover:
+
+1. What TempDB is used for  
+2. Common TempDB problems  
+3. Quick health check scripts  
+4. Finding heavy TempDB consumers  
+5. Detecting TempDB contention  
+6. Configuration and tuning recommendations  
+7. Extended Events for TempDB space errors  
+8. Query tuning ideas  
+9. Operational runbook for production incidents  
+
+## 1. TempDB fundamentals
+
+TempDB is a global, shared system database used by every user database on the instance. It is recreated empty on every SQL Server restart, but during uptime it is heavily used for temporary tables, table variables, work tables, version store, cursors, and intermediate results. [dev](https://dev.to/arvind_toorpu/sql-server-tempdb-common-issues-and-how-to-handle-them-effectively-368g)
+
+Because TempDB is shared, a single badly written query or heavy workload can create problems for all databases and users on the server. This makes TempDB a critical focus area for DBAs. [brentozar](https://www.brentozar.com/archive/2011/10/how-tell-if-tempdb-performance-problem/)
+
+## 2. Common TempDB problems
+
+Typical TempDB issues seen in production include:
+
+1. TempDB running out of space and throwing errors 1101 and 1105. [automatesql](https://www.automatesql.com/blog/sql-server-troubleshoot-tempdb-space)
+2. TempDB data or log growing very fast and filling the disk. [dev](https://dev.to/arvind_toorpu/sql-server-tempdb-common-issues-and-how-to-handle-them-effectively-368g)
+3. Allocation bitmap contention on PFS, GAM, and SGAM pages, visible as PAGELATCH waits. [sqlshack](https://www.sqlshack.com/monitoring-sql-server-tempdb-with-dynamic-management-views/)
+4. High I/O latency on TempDB files. [houseofbrick](https://houseofbrick.com/blog/sql-server-tempdb/)
+5. Excessive version store usage due to snapshot isolation or long-running transactions. [learn.microsoft](https://learn.microsoft.com/en-us/sql/relational-databases/databases/tempdb-database?view=sql-server-ver17)
+
+Troubleshooting usually starts by determining whether the primary issue is space, contention, or I/O latency and then finding which queries or workloads are driving TempDB usage. [sqlshack](https://www.sqlshack.com/monitoring-sql-server-tempdb-with-dynamic-management-views/)
+
+## 3. Quick health check scripts
+
+### 3.1 Check TempDB file layout and configuration
+
+Use the following script to review TempDB file count, size, growth, and location:
+
+```sql
+USE tempdb;
+GO
+
+SELECT 
+    db_name(database_id) AS DatabaseName,
+    name AS FileName,
+    type_desc AS FileType,
+    physical_name,
+    size * 8 / 1024 AS SizeMB,
+    max_size,
+    growth,
+    CASE is_percent_growth
+        WHEN 1 THEN 'PERCENT'
+        ELSE 'PAGES'
+    END AS GrowthType,
+    growth * CASE is_percent_growth WHEN 1 THEN 1.0 ELSE 8.0 / 1024 END AS GrowthValue,
+    state_desc
+FROM sys.database_files
+WHERE database_id = 2;
+```
+
+Key checks for you as DBA:
+
+1. Multiple TempDB data files of equal size, usually between 4 and 8 for many servers. [learn.microsoft](https://learn.microsoft.com/en-us/troubleshoot/sql/database-engine/performance/recommendations-reduce-allocation-contention)
+2. Sensible initial file sizes to avoid constant autogrowth. [houseofbrick](https://houseofbrick.com/blog/sql-server-tempdb/)
+3. Autogrowth configured in megabytes, not as a percentage. [learn.microsoft](https://learn.microsoft.com/en-us/troubleshoot/sql/database-engine/performance/recommendations-reduce-allocation-contention)
+4. Files placed on fast storage, ideally separate from user data and log if possible. [houseofbrick](https://houseofbrick.com/blog/sql-server-tempdb/)
+
+### 3.2 Monitor TempDB space usage in real time
+
+Use this DMV to see how TempDB space is being used inside the database:
+
+```sql
+SELECT 
+    SUM(user_object_reserved_page_count) * 8 / 1024 AS UserObjectsMB,
+    SUM(internal_object_reserved_page_count) * 8 / 1024 AS InternalObjectsMB,
+    SUM(version_store_reserved_page_count) * 8 / 1024 AS VersionStoreMB,
+    SUM(unallocated_extent_page_count) * 8 / 1024 AS FreeSpaceMB,
+    SUM(mixed_extent_page_count) * 8 / 1024 AS MixedExtentsMB
+FROM sys.dm_db_file_space_usage;
+```
+
+Interpretation:
+
+1. UserObjectsMB: space used by temp tables and table variables. [learn.microsoft](https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-views/sys-dm-db-file-space-usage-transact-sql?view=sql-server-ver17)
+2. InternalObjectsMB: work tables used for sorts, hashes, spools, and other internal operations. [learn.microsoft](https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-views/sys-dm-db-file-space-usage-transact-sql?view=sql-server-ver17)
+3. VersionStoreMB: space used for row versioning, important when snapshot isolation or RCSI is enabled. [learn.microsoft](https://learn.microsoft.com/en-us/sql/relational-databases/databases/tempdb-database?view=sql-server-ver17)
+4. FreeSpaceMB: unallocated space left inside TempDB files. [learn.microsoft](https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-views/sys-dm-db-file-space-usage-transact-sql?view=sql-server-ver17)
+
+You can plug this into your monitoring tool or run it periodically during peak workload.
+
+## 4. Finding heavy TempDB consumers
+
+When TempDB is growing quickly or almost full, you need to know which sessions and queries are consuming it.
+
+### 4.1 Top TempDB consumers by session
+
+```sql
+SELECT TOP 20
+    s.session_id,
+    s.login_name,
+    s.host_name,
+    s.program_name,
+    r.status,
+    r.command,
+    tsk.exec_context_id,
+    (u.user_objects_alloc_page_count 
+        + u.internal_objects_alloc_page_count) * 8 / 1024 AS AllocatedMB,
+    (u.user_objects_dealloc_page_count 
+        + u.internal_objects_dealloc_page_count) * 8 / 1024 AS DeallocatedMB,
+    r.blocking_session_id,
+    r.wait_type,
+    r.wait_time,
+    r.cpu_time,
+    r.logical_reads,
+    r.writes,
+    r.total_elapsed_time,
+    SUBSTRING(
+        qt.text,
+        (r.statement_start_offset/2) + 1,
+        CASE 
+            WHEN r.statement_end_offset = -1 
+                 OR r.statement_end_offset = 0 
+            THEN LEN(qt.text) - (r.statement_start_offset/2) + 1
+            ELSE (r.statement_end_offset - r.statement_start_offset)/2 + 1
+        END
+    ) AS RunningStatement,
+    qt.text AS BatchText
+FROM sys.dm_db_session_space_usage AS u
+JOIN sys.dm_exec_sessions AS s
+    ON u.session_id = s.session_id
+LEFT JOIN sys.dm_exec_requests AS r
+    ON u.session_id = r.session_id
+OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) AS qt
+LEFT JOIN sys.dm_os_tasks tsk
+    ON r.session_id = tsk.session_id
+WHERE s.is_user_process = 1
+ORDER BY AllocatedMB DESC;
+```
+
+This script shows which sessions have allocated the most TempDB space, along with the running statement and the full batch text. Focus on the top few sessions and correlate them with login name, host name, and application. [automatesql](https://www.automatesql.com/blog/sql-server-troubleshoot-tempdb-space)
+
+### 4.2 Aggregate TempDB usage by database
+
+```sql
+SELECT 
+    DB_NAME(database_id) AS DatabaseName,
+    SUM(user_objects_alloc_page_count + internal_objects_alloc_page_count) * 8 / 1024 AS AllocatedMB
+FROM sys.dm_db_session_space_usage AS ssu
+JOIN sys.dm_exec_sessions AS s
+    ON ssu.session_id = s.session_id
+JOIN sys.dm_exec_requests AS r
+    ON s.session_id = r.session_id
+GROUP BY DB_NAME(database_id)
+ORDER BY AllocatedMB DESC;
+```
+
+This helps identify which user database or workload is driving the largest TempDB allocations. [sqlshack](https://www.sqlshack.com/monitoring-sql-server-tempdb-with-dynamic-management-views/)
+
+## 5. Detecting TempDB contention
+
+Allocation bitmap contention on PFS, GAM, and SGAM pages in TempDB appears as PAGELATCH_UP or PAGELATCH_EX waits and can significantly slow down activity. [learn.microsoft](https://learn.microsoft.com/en-us/troubleshoot/sql/database-engine/performance/recommendations-reduce-allocation-contention)
+
+### 5.1 Check for TempDB PAGELATCH waits
+
+```sql
+SELECT 
+    wait_type,
+    waiting_tasks_count,
+    wait_time_ms,
+    resource_description
+FROM sys.dm_os_waiting_tasks
+WHERE wait_type LIKE 'PAGELATCH_%'
+  AND resource_description LIKE '2:%'   -- database_id 2 = tempdb
+ORDER BY wait_time_ms DESC;
+```
+
+If you see high waiting_tasks_count and large wait_time_ms for PAGELATCH waits on database id 2, you likely have TempDB allocation contention. [sqlshack](https://www.sqlshack.com/monitoring-sql-server-tempdb-with-dynamic-management-views/)
+
+### 5.2 Wait stats snapshot for TempDB-related waits
+
+```sql
+SELECT 
+    wait_type,
+    waiting_tasks_count,
+    wait_time_ms / 1000.0 AS WaitTimeSeconds
+FROM sys.dm_os_wait_stats
+WHERE wait_type IN ('PAGELATCH_UP','PAGELATCH_EX','WRITELOG','IO_COMPLETION')
+ORDER BY wait_time_ms DESC;
+```
+
+Use this periodically or compare with your baseline to see if TempDB-related waits are trending up. [brentozar](https://www.brentozar.com/archive/2011/10/how-tell-if-tempdb-performance-problem/)
+
+## 6. Configuration and tuning recommendations
+
+When TempDB consistently shows contention or space issues, configuration changes can help stabilize the system.
+
+### 6.1 TempDB file count and sizing
+
+General guidelines: [learn.microsoft](https://learn.microsoft.com/en-us/troubleshoot/sql/database-engine/performance/recommendations-reduce-allocation-contention)
+
+1. Use a single TempDB log file and multiple TempDB data files.  
+2. Start with 4 to 8 data files and do not exceed the number of logical schedulers unless you have evidence to justify it.  
+3. Make all TempDB data files the same size and same autogrowth settings.  
+4. Pre-size TempDB so that normal workload does not rely on frequent autogrowth.  
+
+Example script to add more TempDB data files:
+
+```sql
+USE master;
+GO
+
+ALTER DATABASE tempdb 
+ADD FILE (
+    NAME = tempdev2,
+    FILENAME = 'E:\SQLData\tempdb2.ndf',
+    SIZE = 4096MB,
+    FILEGROWTH = 512MB
+);
+
+ALTER DATABASE tempdb 
+ADD FILE (
+    NAME = tempdev3,
+    FILENAME = 'E:\SQLData\tempdb3.ndf',
+    SIZE = 4096MB,
+    FILEGROWTH = 512MB
+);
+
+ALTER DATABASE tempdb 
+ADD FILE (
+    NAME = tempdev4,
+    FILENAME = 'E:\SQLData\tempdb4.ndf',
+    SIZE = 4096MB,
+    FILEGROWTH = 512MB
+);
+
+ALTER DATABASE tempdb 
+ADD FILE (
+    NAME = tempdev5,
+    FILENAME = 'E:\SQLData\tempdb5.ndf',
+    SIZE = 4096MB,
+    FILEGROWTH = 512MB
+);
+```
+
+Change drive letters, file names, and sizes according to your environment.
+
+Modern SQL Server versions can create multiple TempDB data files automatically during setup, but you should still validate file count, size, and growth settings after installation. [learn.microsoft](https://learn.microsoft.com/en-us/sql/relational-databases/databases/tempdb-database?view=sql-server-ver17)
+
+### 6.2 Version-specific improvements and trace flags
+
+Newer SQL Server versions include automatic improvements for TempDB allocation and metadata contention. On older versions, trace flags such as 1117 and 1118 were commonly used for TempDB to force files to grow together and to favor uniform extent allocations, reducing contention. [learn.microsoft](https://learn.microsoft.com/en-us/sql/relational-databases/databases/tempdb-database?view=sql-server-ver17)
+
+Always check the official version-specific documentation and confirm behavior before enabling or removing trace flags on a production instance. [learn.microsoft](https://learn.microsoft.com/en-us/troubleshoot/sql/database-engine/performance/recommendations-reduce-allocation-contention)
+
+## 7. Extended Events for “TempDB is full” errors
+
+When TempDB runs out of space and raises error 1101 or 1105, you need a way to capture the exact queries and sessions responsible at that moment. [sqlservercentral](https://www.sqlservercentral.com/forums/topic/error-1105-severity-17-state-2-1)
+
+### 7.1 Create Extended Events session
+
+```sql
+CREATE EVENT SESSION [page_allocation_error] ON SERVER
+ADD EVENT sqlserver.error_reported(
+    ACTION(
+        sqlserver.client_app_name,
+        sqlserver.client_hostname,
+        sqlserver.database_id,
+        sqlserver.session_id,
+        sqlserver.session_nt_username,
+        sqlserver.sql_text,
+        sqlserver.tsql_stack,
+        sqlserver.plan_handle
+    )
+    WHERE (
+        [sqlserver].[database_id] = 2         -- tempdb
+        AND [sqlserver].[session_id] > 50     -- ignore system sessions
+        AND [error_number] IN (1101, 1105)    -- allocation/space errors
+    )
+)
+ADD TARGET package0.event_file(
+    SET filename = 'C:\XE\page_allocation_error.xel',
+        max_file_size = 50,
+        max_rollover_files = 4
+)
+WITH (
+    MAX_MEMORY = 4096 KB,
+    EVENT_RETENTION_MODE = ALLOW_SINGLE_EVENT_LOSS,
+    MAX_DISPATCH_LATENCY = 5 SECONDS,
+    TRACK_CAUSALITY = ON,
+    STARTUP_STATE = ON
+);
+GO
+
+ALTER EVENT SESSION [page_allocation_error] ON SERVER STATE = START;
+GO
+```
+
+This session captures TempDB allocation-related errors with query text, stack, and session metadata for later analysis. [automatesql](https://www.automatesql.com/blog/sql-server-troubleshoot-tempdb-space)
+
+### 7.2 Read captured events
+
+```sql
+WITH x AS
+(
+    SELECT
+        object_name,
+        CONVERT(XML, event_data) AS event_data
+    FROM sys.fn_xe_file_target_read_file(
+        'C:\XE\page_allocation_error*.xel',
+        NULL,
+        NULL,
+        NULL
+    )
+)
+SELECT TOP 50
+    x.object_name,
+    x.event_data.value('(event/@timestamp) [learn.microsoft](https://learn.microsoft.com/en-us/sql/relational-databases/databases/tempdb-database?view=sql-server-ver17)', 'datetime2') AS EventTime,
+    x.event_data.value('(event/data[@name="error_number"]/value) [learn.microsoft](https://learn.microsoft.com/en-us/sql/relational-databases/databases/tempdb-database?view=sql-server-ver17)', 'int') AS ErrorNumber,
+    x.event_data.value('(event/data[@name="message"]/value) [learn.microsoft](https://learn.microsoft.com/en-us/sql/relational-databases/databases/tempdb-database?view=sql-server-ver17)', 'nvarchar(4000)') AS ErrorMessage,
+    x.event_data.value('(event/action[@name="session_id"]/value) [learn.microsoft](https://learn.microsoft.com/en-us/sql/relational-databases/databases/tempdb-database?view=sql-server-ver17)', 'int') AS SessionID,
+    x.event_data.value('(event/action[@name="database_id"]/value) [learn.microsoft](https://learn.microsoft.com/en-us/sql/relational-databases/databases/tempdb-database?view=sql-server-ver17)', 'int') AS DatabaseID,
+    x.event_data.value('(event/action[@name="client_hostname"]/value) [learn.microsoft](https://learn.microsoft.com/en-us/sql/relational-databases/databases/tempdb-database?view=sql-server-ver17)', 'nvarchar(256)') AS HostName,
+    x.event_data.value('(event/action[@name="client_app_name"]/value) [learn.microsoft](https://learn.microsoft.com/en-us/sql/relational-databases/databases/tempdb-database?view=sql-server-ver17)', 'nvarchar(256)') AS AppName,
+    x.event_data.value('(event/action[@name="session_nt_username"]/value) [learn.microsoft](https://learn.microsoft.com/en-us/sql/relational-databases/databases/tempdb-database?view=sql-server-ver17)', 'nvarchar(256)') AS NTUser,
+    x.event_data.value('(event/action[@name="sql_text"]/value) [learn.microsoft](https://learn.microsoft.com/en-us/sql/relational-databases/databases/tempdb-database?view=sql-server-ver17)', 'nvarchar(max)') AS SqlText,
+    x.event_data.value('(event/action[@name="tsql_stack"]/value) [learn.microsoft](https://learn.microsoft.com/en-us/sql/relational-databases/databases/tempdb-database?view=sql-server-ver17)', 'nvarchar(max)') AS TsqlStack
+FROM x
+ORDER BY EventTime DESC;
+```
+
+This gives you a historical list of which sessions and statements were running at the time TempDB space errors occurred. [automatesql](https://www.automatesql.com/blog/sql-server-troubleshoot-tempdb-space)
+
+## 8. Query tuning to reduce TempDB usage
+
+Long-term TempDB stability depends on application and query design, not only on configuration.
+
+Common patterns that increase TempDB usage: [dev](https://dev.to/arvind_toorpu/sql-server-tempdb-common-issues-and-how-to-handle-them-effectively-368g)
+
+1. Large temp tables or table variables without proper indexing.  
+2. Hash joins and sorts against big datasets, causing spills.  
+3. Overuse of global temporary tables.  
+4. Snapshot isolation or RCSI with long-running transactions.  
+5. Large table-valued parameters and multi-step batch processing with big intermediate result sets.  
+
+High-level tuning approaches:
+
+1. Add or adjust indexes to reduce large spills and heavy sorts.  
+2. Replace row-by-row logic with set-based patterns where possible.  
+3. Use local temporary tables instead of global ones unless truly needed.  
+4. Keep transactions short when using snapshot isolation to control version store size. [sqlshack](https://www.sqlshack.com/monitoring-sql-server-tempdb-with-dynamic-management-views/)
+
+Execution plans with spill warnings on sort or hash operators are a good place to start when tuning queries affecting TempDB. [brentozar](https://www.brentozar.com/archive/2011/10/how-tell-if-tempdb-performance-problem/)
+
+9. Operational runbook for TempDB incidents
+
+When you receive an alert or incident related to TempDB, follow a structured process.
+
+Step 1: Confirm TempDB state  
+
+a. Run the file configuration script to verify the number of files, sizes, and growth settings.  
+b. Run the space usage DMV to see current allocation by user objects, internal objects, and version store.  
+
+Step 2: Identify heavy consumers  
+
+a. Use the session-space usage script to find top sessions by TempDB allocation.  
+b. Check which databases, hosts, and applications those sessions belong to.  
+
+Step 3: Stabilize the system  
+
+a. If TempDB or the disk is nearly full, consider adding disk space or increasing TempDB file size as a temporary measure. [reddit](https://www.reddit.com/r/SQLServer/comments/1bja4dd/tempdb_suddenly_full_and_need_to_take_action/)
+b. Avoid aggressive shrinking when the workload is active because that can cause more contention and fragmentation. [reddit](https://www.reddit.com/r/SQLServer/comments/1bja4dd/tempdb_suddenly_full_and_need_to_take_action/)
+
+Step 4: Plan and implement permanent fixes  
+
+a. Adjust TempDB configuration: file count, pre-sizing, autogrowth settings, and drive placement. [houseofbrick](https://houseofbrick.com/blog/sql-server-tempdb/)
+b. Work with developers to tune or redesign the problematic queries and patterns.  
+c. Keep the Extended Events session enabled on critical instances so you always have evidence when TempDB fills up. [automatesql](https://www.automatesql.com/blog/sql-server-troubleshoot-tempdb-space)
+
